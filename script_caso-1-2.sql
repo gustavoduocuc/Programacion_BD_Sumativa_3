@@ -98,7 +98,16 @@ SELECT * FROM total_consumos WHERE id_huesped IN (340006,340008);
 
 /*==========================================================
   CASO 2
-  PACKAGE: Función para total tours en USD + variable pública opcional
+  PACKAGE PKG_COBRANZA_HOTEL
+
+  Este package centraliza el cálculo del monto total en USD
+  correspondiente a los tours contratados por un huésped.
+
+  Se expone:
+  - Una variable pública (opcional) para dejar disponible
+    el último monto calculado.
+  - Una función que obtiene el total de tours multiplicando
+    el valor del tour por el número de personas asociadas.
 ==========================================================*/
 
 CREATE OR REPLACE PACKAGE PKG_COBRANZA_HOTEL IS
@@ -110,10 +119,16 @@ CREATE OR REPLACE PACKAGE PKG_COBRANZA_HOTEL IS
 END PKG_COBRANZA_HOTEL;
 /
 
+
 CREATE OR REPLACE PACKAGE BODY PKG_COBRANZA_HOTEL IS
+  /*  
+    Calcula el total de tours contratados por un huésped.
+    Si el huésped no registra tours, retorna 0.
+  */
   FUNCTION FN_MONTO_TOURS_USD(p_id_huesped NUMBER) RETURN NUMBER IS
     v_total NUMBER;
   BEGIN
+   --  Se utiliza NVL para asegurar que el proceso nunca interrumpa el flujo principal por ausencia de datos.
     SELECT NVL(SUM(t.valor_tour * NVL(ht.num_personas,1)), 0)
       INTO v_total
       FROM huesped_tour ht
@@ -137,9 +152,11 @@ SHOW ERRORS;
 
 
 /*==========================================================
-  FUNCION 1: Obtener agencia del huésped
-  - Si hay error (incluye NO_DATA_FOUND) registra en REG_ERRORES con SQ_ERROR
-  - Retorna "NO REGISTRA AGENCIA"
+  FUNCION: FN_OBT_AGENCIA_HUESPED
+  Recupera la agencia asociada al huésped.
+  Si ocurre algún problema (datos inexistentes o error),
+  se registra en REG_ERRORES y se retorna el texto
+  'NO REGISTRA AGENCIA', tal como indican las reglas.
 ==========================================================*/
 
 CREATE OR REPLACE FUNCTION FN_OBT_AGENCIA_HUESPED(p_id_huesped NUMBER)
@@ -179,8 +196,13 @@ SHOW ERRORS;
 
 
 /*==========================================================
-  FUNCION 2: Obtener consumos del huésped en USD (desde TOTAL_CONSUMOS)
-  - Si no registra consumos, devuelve 0
+  FUNCION: FN_OBT_CONSUMOS_USD
+  Obtiene el monto total de consumos del huésped
+  desde la tabla TOTAL_CONSUMOS.
+
+  Si el huésped no registra consumos o ocurre un error,
+  el proceso no se detiene y retorna 0, registrando
+  el incidente en REG_ERRORES.
 ==========================================================*/
 
 CREATE OR REPLACE FUNCTION FN_OBT_CONSUMOS_USD(p_id_huesped NUMBER)
@@ -219,9 +241,11 @@ SHOW ERRORS;
 
 
 /*==========================================================
-  SUBPROGRAMA EXTRA (para que el proceso sea más limpio):
-  Obtener % descuento por tramos de consumos
-  - Si no encuentra tramo, 0%
+  SUBPROGRAMA EXTRA FN_OBT_PCT_DESC_CONSUMOS (para que el proceso quede mas limpio y legible)
+  Determina el porcentaje de descuento aplicable a los
+  consumos, cruzando el monto con la tabla TRAMOS_CONSUMOS.
+
+  Si el monto no cae en ningún tramo, se asume 0%.
 ==========================================================*/
 
 CREATE OR REPLACE FUNCTION FN_OBT_PCT_DESC_CONSUMOS(p_consumos_usd NUMBER)
@@ -245,12 +269,71 @@ END;
 /
 SHOW ERRORS;
 
+/*==========================================================
+  FUNCION: FN_OBT_TIPO_HABITACION
+  Recupera el tipo de habitación asociado a una reserva.
+  Este dato es necesario para determinar la capacidad
+  máxima y calcular el recargo por persona.
+  
+  - Retorna tipo_habitacion
+  - Si hay error, registra en REG_ERRORES
+  - Retorna 'S' por defecto
+==========================================================*/
+
+CREATE OR REPLACE FUNCTION FN_OBT_TIPO_HABITACION(p_id_reserva NUMBER)
+RETURN VARCHAR2
+IS
+  v_tipo_habitacion VARCHAR2(2);
+  v_msg             VARCHAR2(400);
+  v_id_error        NUMBER;
+BEGIN
+
+  SELECT h.tipo_habitacion
+    INTO v_tipo_habitacion
+    FROM detalle_reserva dr
+    JOIN habitacion h ON h.id_habitacion = dr.id_habitacion
+   WHERE dr.id_reserva = p_id_reserva
+     AND ROWNUM = 1;
+
+  RETURN v_tipo_habitacion;
+
+EXCEPTION
+  WHEN OTHERS THEN
+
+    v_msg := SQLERRM;
+    SELECT sq_error.NEXTVAL INTO v_id_error FROM dual;
+
+    INSERT INTO reg_errores (id_error, nomsubprograma, msg_error)
+    VALUES (
+      v_id_error,
+      'Error en FN_OBT_TIPO_HABITACION al recuperar el tipo de habitacion de la reserva con Id '
+      || TO_CHAR(p_id_reserva),
+      v_msg
+    );
+
+    RETURN 'S'; -- valor por defecto
+END;
+/
+SHOW ERRORS;
+
 
 /*==========================================================
   PROCEDIMIENTO PRINCIPAL: Generar DETALLE_DIARIO_HUESPEDES
+  Genera el detalle diario de huéspedes que finalizan
+  su estadía en la fecha indicada.
+
+  El procedimiento:
+  - Calcula alojamiento (habitación + minibar por días).
+  - Aplica recargo por persona según capacidad.
+  - Obtiene consumos y tours.
+  - Determina descuentos por tramos y por agencia.
+  - Calcula subtotal y total final.
+  - Convierte los valores a CLP según tipo de cambio.
+  - Registra errores sin interrumpir el proceso.
+
   Parámetros:
-   - p_fecha_actual: día a procesar
-   - p_tipo_cambio: valor dólar
+    p_fecha_actual : fecha a procesar
+    p_tipo_cambio  : valor del dólar
 ==========================================================*/
 
 CREATE OR REPLACE PROCEDURE SP_GENERA_DETALLE_DIARIO(
@@ -273,8 +356,11 @@ IS
   v_alojamiento_usd     NUMBER;
   v_consumos_usd        NUMBER;
   v_tours_usd           NUMBER;
-
+    
   v_valor_personas_usd  NUMBER;
+  v_tipo_habitacion     VARCHAR2(2);
+  v_capacidad_personas  NUMBER;
+  v_personas_total      NUMBER;
 
   v_subtotal_usd        NUMBER;
 
@@ -309,14 +395,37 @@ BEGIN
     -- Agencia 
     v_agencia := FN_OBT_AGENCIA_HUESPED(reg.id_huesped);
 
-    -- Alojamiento: (habitación + minibar) diario * estadía
-    -- Si hay más de una habitación asociada a la reserva, se suman los diarios.
+    -- Se calcula el valor diario total (habitación + minibar)
+    -- y luego se multiplica por la cantidad de días de estadía.
     SELECT NVL(SUM(h.valor_habitacion + h.valor_minibar), 0)
       INTO v_diario_habitacion
       FROM detalle_reserva dr
       JOIN habitacion h ON h.id_habitacion = dr.id_habitacion
      WHERE dr.id_reserva = reg.id_reserva;
-
+     
+    -- Se obtiene el tipo de habitacion
+    v_tipo_habitacion := FN_OBT_TIPO_HABITACION(reg.id_reserva);
+        
+    -- Se determina capacidad según tipo de habitacion
+    IF v_tipo_habitacion = 'S' THEN
+       v_capacidad_personas := 1;
+    ELSIF v_tipo_habitacion = 'D' THEN
+       v_capacidad_personas := 2;
+    ELSIF v_tipo_habitacion = 'T' THEN
+       v_capacidad_personas := 3;
+    ELSIF v_tipo_habitacion = 'C' THEN
+       v_capacidad_personas := 4;
+    ELSE
+       v_capacidad_personas := 1;
+    END IF;
+    
+    -- Personas por estadía completa
+    v_personas_total := v_capacidad_personas * reg.estadia;
+    
+    -- Convertir 35.000 CLP a USD y multiplicar por personas
+    v_valor_personas_usd := (35000 * v_personas_total) / p_tipo_cambio;
+    
+    -- Calculo de valor alojamiento en USD multiplicando el valor diario por el numero de dias
     v_alojamiento_usd := v_diario_habitacion * reg.estadia;
 
     -- Consumos desde TOTAL_CONSUMOS
@@ -325,18 +434,12 @@ BEGIN
     -- Tours desde Package
     v_tours_usd := PKG_COBRANZA_HOTEL.FN_MONTO_TOURS_USD(reg.id_huesped);
 
-    /*
-      Valor por persona:
-      Se asume 1 persona por huésped por ausencia de numero de personas en reserva.
-      Conversion de 35.000 CLP a USD para asegurar el cambio
-    */
-    v_valor_personas_usd := 35000 / p_tipo_cambio;
-
-    -- Subtotal general de servicios (se incluye tours como parte del cobro total del huésped)
+    -- El subtotal se compone estrictamente de:
+    -- Alojamiento + Consumos + Valor por persona.
+    -- Los tours se registran, pero no forman parte del subtotal.
     v_subtotal_usd := v_alojamiento_usd
                     + v_consumos_usd
-                    + v_valor_personas_usd
-                    + v_tours_usd;
+                    + v_valor_personas_usd;
 
     -- Descuento por consumos (usamos TRAMOS_CONSUMOS como lógica de descuento)
     v_pct_desc_consumos := FN_OBT_PCT_DESC_CONSUMOS(v_consumos_usd);
@@ -350,7 +453,9 @@ BEGIN
       v_desc_agencia_usd := 0;
     END IF;
 
-    -- Total final (descuentos sobre base, tours se cobra completo)
+    -- El total final corresponde a:
+    -- Subtotal - Descuento por consumos - Descuento por agencia (Si aplica).
+    -- Los tours no participan en este cálculo.
     v_total_usd := v_subtotal_usd
                - v_desc_consumos_usd
                - v_desc_agencia_usd;
